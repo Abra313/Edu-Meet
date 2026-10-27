@@ -5,6 +5,8 @@ import {
   Printer, School, Search, Settings, Shield, Users, X,
 } from 'lucide-react';
 import LandingPage from './LandingPage.jsx';
+import { supabase, supabaseConfigured } from './lib/supabase.js';
+import { loadSchoolContext, saveSchoolWorkspace, provisionSchoolMember } from './lib/schoolData.js';
 
 const KEYS = {
   accounts: '@edu-meet/accounts',
@@ -95,22 +97,10 @@ function readWorkspace(user) {
 function readableRole(role) { return role === 'super-admin' ? 'Super admin' : role[0].toUpperCase() + role.slice(1); }
 
 function App() {
-  const [accountsState, setAccountsState] = useState(() => loadAccounts());
-  const [user, setUser] = useState(() => {
-    const { accounts, roleAssignments } = loadAccounts();
-    const savedUid = localStorage.getItem(KEYS.session);
-    const savedStudentId = localStorage.getItem(KEYS.studentSession);
-    if (savedUid) {
-      const account = accounts.find((item) => item.uid === savedUid);
-      if (account && roleAssignments[account.uid]) return { ...account, role: roleAssignments[account.uid] };
-    }
-    if (savedStudentId) {
-      const student = readJson(KEYS.students, []).find((item) => item.admissionNumber === savedStudentId);
-      if (student) return { ...student, uid: student.admissionNumber, role: 'student' };
-    }
-    return null;
-  });
+  const [accountsState, setAccountsState] = useState({ accounts: [], roleAssignments: {} });
+  const [user, setUser] = useState(null);
   const [workspace, setWorkspace] = useState(() => blankWorkspace({}));
+  const [authLoading, setAuthLoading] = useState(true);
   const [activePage, setActivePage] = useState('home');
   const [authMode, setAuthMode] = useState('signIn');
   const [showAuth, setShowAuth] = useState(false);
@@ -125,17 +115,36 @@ function App() {
   const [notice, setNotice] = useState('');
 
   useEffect(() => {
-    if (user) setWorkspace(readWorkspace(user));
-  }, [user]);
+    let active = true;
+    const restoreSession = async () => {
+      try {
+        if (!supabaseConfigured || !supabase) return;
+        const { data, error } = await supabase.auth.getSession();
+        if (error) throw error;
+        if (!data.session) return;
+        const context = await loadSchoolContext(data.session.user);
+        if (active) {
+          setWorkspace(context.workspace);
+          setUser(context.user);
+        }
+      } catch (error) {
+        if (active) setAuthError(`Could not restore your saved session. ${error instanceof Error ? error.message : 'Please sign in again.'}`);
+      } finally {
+        if (active) setAuthLoading(false);
+      }
+    };
+    restoreSession();
+    return () => { active = false; };
+  }, []);
 
-  const persistWorkspace = (updated) => {
-    writeJson(KEYS.workspace, updated);
+  const persistWorkspace = async (updated) => {
+    await saveSchoolWorkspace(updated);
     setWorkspace(updated);
   };
-  const signOut = () => {
-    localStorage.removeItem(KEYS.session);
-    localStorage.removeItem(KEYS.studentSession);
+  const signOut = async () => {
+    if (supabase) await supabase.auth.signOut();
     setUser(null);
+    setWorkspace(blankWorkspace({}));
     setActivePage('home');
     setAuthMode('signIn');
     setShowAuth(false);
@@ -146,12 +155,15 @@ function App() {
     event.preventDefault();
     setAuthError('');
     setAuthNotice('');
+    if (!supabase || !supabaseConfigured) {
+      setAuthError('Supabase is not configured. Check your environment settings and restart the app.');
+      return;
+    }
     const form = new FormData(event.currentTarget);
     const password = String(form.get('password') || '');
     if (password.length < 8) { setAuthError('Your password must be at least 8 characters.'); return; }
     setAuthBusy(true);
     try {
-      const passwords = readJson(KEYS.passwords, {});
       if (authMode === 'signUp') {
         const name = String(form.get('name') || '').trim();
         const email = String(form.get('email') || '').trim().toLowerCase();
@@ -159,46 +171,44 @@ function App() {
         if (!name) throw new Error('Enter your full name.');
         if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) throw new Error('Enter a valid email address.');
         if (password !== confirmPassword) throw new Error('The passwords do not match.');
-        const { accounts, roleAssignments } = loadAccounts();
-        if (accounts.some((account) => account.email?.toLowerCase() === email)) throw new Error('An account with this email already exists on this device.');
-        const account = { uid: createId(), name, email, schoolName: '', role: 'admin' };
-        passwords[email] = await hashPassword(password);
-        roleAssignments[account.uid] = 'admin';
-        writeJson(KEYS.passwords, passwords);
-        writeJson(KEYS.accounts, [...accounts, account]);
-        writeJson(KEYS.roles, roleAssignments);
-        writeJson(KEYS.workspace, blankWorkspace(account));
-        localStorage.setItem(KEYS.session, account.uid);
-        setAccountsState({ accounts: [...accounts, account], roleAssignments });
-        setUser(account);
+        const { data, error } = await supabase.auth.signUp({
+          email,
+          password,
+          options: { data: { signup_type: 'school_owner', full_name: name, school_name: 'Your school' } },
+        });
+        if (error) throw error;
+        if (!data.session || !data.user) {
+          setAuthNotice('Check your email to confirm your account, then sign in to continue.');
+          return;
+        }
+        const context = await loadSchoolContext(data.user);
+        setWorkspace(context.workspace);
+        setUser(context.user);
         return;
       }
       if (loginType === 'student') {
         const admissionNumber = String(form.get('admissionNumber') || '').trim().toUpperCase();
         if (!admissionNumber) throw new Error('Enter your admission number.');
-        const students = readJson(KEYS.students, []);
-        const student = students.find((item) => item.admissionNumber === admissionNumber);
-        if (!student) throw new Error('No student with this admission number was found on this device. Ask your school administrator for access.');
-        if (student.status === 'Inactive') throw new Error('This student account is inactive. Please contact your school administrator.');
-        if (!await verifyPassword(password, passwords[`student:${admissionNumber}`])) throw new Error('The admission number or password is incorrect.');
-        localStorage.setItem(KEYS.studentSession, admissionNumber);
-        setUser({ ...student, uid: admissionNumber, role: 'student' });
+        const { data, error } = await supabase.functions.invoke('student-sign-in', { body: { admissionNumber, password } });
+        if (error) throw new Error(error.message || 'The admission number or password is incorrect.');
+        if (data?.error) throw new Error(data.error);
+        const { data: sessionData, error: sessionError } = await supabase.auth.setSession({
+          access_token: data.access_token,
+          refresh_token: data.refresh_token,
+        });
+        if (sessionError) throw sessionError;
+        const context = await loadSchoolContext(sessionData.user);
+        setWorkspace(context.workspace);
+        setUser(context.user);
         return;
       }
       const email = String(form.get('email') || '').trim().toLowerCase();
       if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) throw new Error('Enter a valid email address.');
-      const { accounts, roleAssignments } = loadAccounts();
-      const account = accounts.find((item) => item.email?.toLowerCase() === email);
-      if (!account) throw new Error('No account with this email was found on this device. Create an account first.');
-      const passwordMatches = account.uid === SUPER_ADMIN.uid
-        ? password === 'edu-meet-demo-only'
-        : await verifyPassword(password, passwords[email]);
-      if (!passwordMatches) throw new Error('The email or password is incorrect.');
-      const role = roleAssignments[account.uid];
-      if (!role) throw new Error('Your account is waiting for a super-admin to assign a role.');
-      localStorage.setItem(KEYS.session, account.uid);
-      setAccountsState({ accounts, roleAssignments });
-      setUser({ ...account, role });
+      const { data, error } = await supabase.auth.signInWithPassword({ email, password });
+      if (error) throw error;
+      const context = await loadSchoolContext(data.user);
+      setWorkspace(context.workspace);
+      setUser(context.user);
     } catch (error) {
       setAuthError(error instanceof Error ? error.message : 'We could not sign in. Please try again.');
     } finally { setAuthBusy(false); }
@@ -233,35 +243,41 @@ function App() {
       if (workspace.students.some((student) => student.admissionNumber === admissionNumber)) throw new Error('That admission number is already in use.');
       if (values.password.length < 8) throw new Error('Set a student password with at least 8 characters.');
       const student = { id, name: values.name.trim(), admissionNumber, className: values.className.trim(), parentName: values.parentName.trim(), parentPhone: values.parentPhone.trim(), status: 'Active' };
+      const provisioned = await provisionSchoolMember({
+        role: 'student',
+        name: student.name,
+        admissionNumber,
+        className: student.className,
+        password: values.password,
+        workspaceRecord: student,
+      });
+      student.authUid = provisioned.authUserId;
       idCard = { type: 'Student', person: student, identifier: admissionNumber };
       updated.students = [...workspace.students, student];
-      const students = readJson(KEYS.students, []);
-      writeJson(KEYS.students, [...students, student]);
-      const passwords = readJson(KEYS.passwords, {});
-      passwords[`student:${admissionNumber}`] = await hashPassword(values.password);
-      writeJson(KEYS.passwords, passwords);
     } else if (kind === 'teacher' || kind === 'parent') {
       const email = values.email.trim().toLowerCase();
       if (!values.name.trim()) throw new Error('Full name is required.');
       if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) throw new Error('Enter a valid email address.');
-      if (accountsState.accounts.some((account) => account.email?.toLowerCase() === email)) throw new Error('That email address already belongs to another account.');
       if (values.password.length < 8) throw new Error('Set a temporary password with at least 8 characters.');
       if (kind === 'teacher' && !values.classId) throw new Error('Assign the teacher to at least one class.');
       const studentAdmissionNumber = values.studentAdmissionNumber?.trim().toUpperCase() || '';
       if (kind === 'parent' && studentAdmissionNumber && !workspace.students.some((student) => student.admissionNumber === studentAdmissionNumber)) throw new Error('No student with this admission number was found in the school register.');
       const staffId = `TCH-${id.split('-').at(-1).toUpperCase()}`;
       const staffMember = { id, authUid: id, staffId, name: values.name.trim(), email, phone: values.phone.trim(), studentAdmissionNumber, role: kind, status: 'Active', classIds: values.classId ? [values.classId] : [], teacherType: 'class', subjects: [] };
+      const provisioned = await provisionSchoolMember({
+        role: kind,
+        name: staffMember.name,
+        email,
+        phone: staffMember.phone,
+        password: values.password,
+        staffId: kind === 'teacher' ? staffId : undefined,
+        classIds: staffMember.classIds,
+        linkedStudentAdmissionNumber: studentAdmissionNumber,
+        workspaceRecord: staffMember,
+      });
+      staffMember.authUid = provisioned.authUserId;
       if (kind === 'teacher') idCard = { type: 'Teacher', person: staffMember, identifier: staffId };
       updated.staff = [...workspace.staff, staffMember];
-      const account = { uid: id, name: staffMember.name, email };
-      const accounts = [...accountsState.accounts, account];
-      const roleAssignments = { ...accountsState.roleAssignments, [id]: kind };
-      const passwords = readJson(KEYS.passwords, {});
-      passwords[email] = await hashPassword(values.password);
-      writeJson(KEYS.passwords, passwords);
-      writeJson(KEYS.accounts, accounts);
-      writeJson(KEYS.roles, roleAssignments);
-      setAccountsState({ accounts, roleAssignments });
     } else if (kind === 'class') {
       if (!CLASS_LEVELS[values.stage]?.includes(values.name)) throw new Error('Choose a class name from the selected school section.');
       if (values.stage === 'Senior Secondary' && !['Science', 'Art', 'Commercial'].includes(values.track)) throw new Error('Choose a Science, Art, or Commercial stream for senior secondary.');
@@ -285,7 +301,7 @@ function App() {
       if (!values.classId || !values.title.trim() || !values.date || !values.subject.trim()) throw new Error('Complete the assessment details.');
       updated.scheduledAssessments = [...workspace.scheduledAssessments, { id, classId: values.classId, title: values.title.trim(), kind: values.kind || 'Test', date: values.date, subject: values.subject.trim(), startTime: values.startTime || '', durationMinutes: Number(values.durationMinutes) || 0 }];
     }
-    persistWorkspace(updated);
+    await persistWorkspace(updated);
     setModal('');
     if (idCard) setGeneratedIdCard(idCard);
     setNotice(`${kind === 'period' ? 'Timetable period' : kind[0].toUpperCase() + kind.slice(1)} saved.`);
